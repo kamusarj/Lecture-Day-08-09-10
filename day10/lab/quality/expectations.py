@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
 
@@ -19,7 +20,30 @@ class ExpectationResult:
     detail: str
 
 
-def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[ExpectationResult], bool]:
+REQUIRED_DOC_IDS = frozenset(
+    {
+        "policy_refund_v4",
+        "sla_p1_2026",
+        "it_helpdesk_faq",
+        "hr_leave_policy",
+        "access_control_sop",
+    }
+)
+
+
+def _parse_iso_datetime(value: str) -> bool:
+    try:
+        datetime.fromisoformat((value or "").strip().replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+def run_expectations(
+    cleaned_rows: List[Dict[str, Any]],
+    *,
+    require_required_doc_ids: bool = True,
+) -> Tuple[List[ExpectationResult], bool]:
     """
     Trả về (results, should_halt).
 
@@ -109,6 +133,84 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
             ok6,
             "halt",
             f"violations={len(bad_hr_annual)}",
+        )
+    )
+
+    # E7: đủ 5 source chính để retrieval không mất coverage ở câu hỏi ẩn/công khai
+    present_doc_ids = {str(r.get("doc_id") or "").strip() for r in cleaned_rows}
+    missing_doc_ids = sorted(REQUIRED_DOC_IDS - present_doc_ids)
+    ok7 = len(missing_doc_ids) == 0 if require_required_doc_ids else True
+    detail7 = f"missing={missing_doc_ids}"
+    if not require_required_doc_ids:
+        detail7 = f"skipped_single_source present={sorted(present_doc_ids)}"
+    results.append(
+        ExpectationResult(
+            "required_doc_ids_present",
+            ok7,
+            "halt",
+            detail7,
+        )
+    )
+
+    # E8: exported_at phải parse được sau clean để freshness monitor đáng tin
+    bad_exported_at = [
+        r
+        for r in cleaned_rows
+        if not _parse_iso_datetime(str(r.get("exported_at") or ""))
+    ]
+    ok8 = len(bad_exported_at) == 0
+    results.append(
+        ExpectationResult(
+            "exported_at_iso_datetime",
+            ok8,
+            "halt",
+            f"invalid_exported_at={len(bad_exported_at)}",
+        )
+    )
+
+    # E9: marker dữ liệu bẩn không được lọt vào cleaned snapshot
+    dirty_markers = [
+        r
+        for r in cleaned_rows
+        if (r.get("chunk_text") or "").lstrip().lower().startswith(("nội dung không rõ ràng:", "!!!"))
+    ]
+    ok9 = len(dirty_markers) == 0
+    results.append(
+        ExpectationResult(
+            "no_dirty_text_markers",
+            ok9,
+            "halt",
+            f"dirty_marker_rows={len(dirty_markers)}",
+        )
+    )
+
+    # E10: chunk_id unique để upsert/prune giữ snapshot ổn định
+    chunk_ids = [str(r.get("chunk_id") or "") for r in cleaned_rows]
+    duplicate_chunk_ids = len(chunk_ids) - len(set(chunk_ids))
+    ok10 = duplicate_chunk_ids == 0
+    results.append(
+        ExpectationResult(
+            "unique_chunk_id",
+            ok10,
+            "halt",
+            f"duplicate_chunk_ids={duplicate_chunk_ids}",
+        )
+    )
+
+    # E11: collection này phục vụ SLA P1, không embed chunk P2/P3/P4 gây nhiễu ranking
+    non_p1_sla = [
+        r
+        for r in cleaned_rows
+        if r.get("doc_id") == "sla_p1_2026"
+        and (r.get("chunk_text") or "").strip().lower().startswith(("ticket p2:", "ticket p3:", "ticket p4:"))
+    ]
+    ok11 = len(non_p1_sla) == 0
+    results.append(
+        ExpectationResult(
+            "sla_p1_no_other_priority_chunks",
+            ok11,
+            "halt",
+            f"non_p1_chunks={len(non_p1_sla)}",
         )
     )
 

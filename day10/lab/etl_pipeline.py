@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 
 from monitoring.freshness_check import check_manifest_freshness
 from quality.expectations import run_expectations
-from transform.cleaning_rules import clean_rows, load_raw_csv, write_cleaned_csv, write_quarantine_csv
+from transform.cleaning_rules import clean_rows, load_raw_records, write_cleaned_csv, write_quarantine_csv
 
 load_dotenv()
 
@@ -46,11 +46,25 @@ def _log(path: Path, line: str) -> None:
         f.write(line + "\n")
 
 
+def _safe_relative(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _raw_source_type(path: Path) -> str:
+    if path.is_dir():
+        return "directory"
+    suffix = path.suffix.lower().lstrip(".")
+    return suffix or "unknown"
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%MZ")
     raw_path = Path(args.raw)
-    if not raw_path.is_file():
-        print(f"ERROR: raw file not found: {raw_path}", file=sys.stderr)
+    if not (raw_path.is_file() or raw_path.is_dir()):
+        print(f"ERROR: raw file or directory not found: {raw_path}", file=sys.stderr)
         return 1
 
     log_path = LOG_DIR / f"run_{run_id.replace(':', '-')}.log"
@@ -61,9 +75,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(msg)
         _log(log_path, msg)
 
-    rows = load_raw_csv(raw_path)
+    try:
+        rows = load_raw_records(raw_path)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
     raw_count = len(rows)
+    source_type = _raw_source_type(raw_path)
+    require_full_doc_coverage = not (raw_path.is_file() and raw_path.suffix.lower() == ".txt")
     log(f"run_id={run_id}")
+    log(f"raw_source_type={source_type}")
     log(f"raw_records={raw_count}")
 
     cleaned, quarantine = clean_rows(
@@ -80,7 +101,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     log(f"cleaned_csv={cleaned_path.relative_to(ROOT)}")
     log(f"quarantine_csv={quar_path.relative_to(ROOT)}")
 
-    results, halt = run_expectations(cleaned)
+    results, halt = run_expectations(
+        cleaned,
+        require_required_doc_ids=require_full_doc_coverage,
+    )
     for r in results:
         sym = "OK" if r.passed else "FAIL"
         log(f"expectation[{r.name}] {sym} ({r.severity}) :: {r.detail}")
@@ -106,7 +130,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     manifest = {
         "run_id": run_id,
         "run_timestamp": datetime.now(timezone.utc).isoformat(),
-        "raw_path": str(raw_path.relative_to(ROOT)),
+        "raw_path": _safe_relative(raw_path),
+        "raw_source_type": source_type,
         "raw_records": raw_count,
         "cleaned_records": len(cleaned),
         "quarantine_records": len(quarantine),
@@ -193,7 +218,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_run = sub.add_parser("run", help="ingest → clean → validate → embed")
-    p_run.add_argument("--raw", default=str(RAW_DEFAULT), help="Đường dẫn CSV raw export")
+    p_run.add_argument("--raw", default=str(RAW_DEFAULT), help="Đường dẫn raw export: CSV, TXT, hoặc thư mục chứa CSV/TXT")
     p_run.add_argument("--run-id", default="", help="ID run (mặc định: UTC timestamp)")
     p_run.add_argument(
         "--no-refund-fix",
